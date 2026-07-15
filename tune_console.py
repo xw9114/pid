@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import shlex
 import socket
@@ -305,6 +306,79 @@ class TuneValues:
     aux: int = 0
 
 
+CONFIG_VERSION = 1
+
+
+def save_config(path: Path, values: dict[int, TuneValues]) -> None:
+    """Atomically save all loop parameters as human-readable JSON."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CONFIG_VERSION,
+        "loops": {
+            str(loop_id): {
+                "kp": config.kp,
+                "ki": config.ki,
+                "kd": config.kd,
+                "aux": config.aux,
+            }
+            for loop_id, config in sorted(values.items())
+        },
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2, allow_nan=False)
+            file.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_config(path: Path) -> dict[int, TuneValues]:
+    """Load loop parameters from JSON, rejecting malformed values."""
+
+    path = Path(path)
+    values = {loop_id: TuneValues() for loop_id in VALID_LOOP_IDS}
+    if not path.exists():
+        return values
+
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError("config root must be a JSON object")
+    version = payload.get("version", CONFIG_VERSION)
+    if version != CONFIG_VERSION:
+        raise ValueError(f"unsupported config version: {version!r}")
+    loops = payload.get("loops")
+    if not isinstance(loops, dict):
+        raise ValueError("config field 'loops' must be an object")
+
+    for loop_id in VALID_LOOP_IDS:
+        item = loops.get(str(loop_id))
+        if item is None:
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(f"config loop {loop_id} must be an object")
+        aux = item.get("aux", 0)
+        if isinstance(aux, bool):
+            raise ValueError(f"config loop {loop_id} aux must be an integer")
+        if isinstance(aux, float) and not aux.is_integer():
+            raise ValueError(f"config loop {loop_id} aux must be an integer")
+        aux = int(aux)
+        if not -32768 <= aux <= 32767:
+            raise ValueError(f"config loop {loop_id} aux must fit int16")
+        values[loop_id] = TuneValues(
+            kp=_require_finite(f"loop {loop_id} kp", item.get("kp", 0.0)),
+            ki=_require_finite(f"loop {loop_id} ki", item.get("ki", 0.0)),
+            kd=_require_finite(f"loop {loop_id} kd", item.get("kd", 0.0)),
+            aux=aux,
+        )
+    return values
+
+
 def adaptive_step(abs_error: float, coarse: float, medium: float, fine: float) -> float:
     """Choose the UI step from the design document's error bands."""
 
@@ -397,8 +471,19 @@ class TunerApp:
         self.args = args
         self.transport = transport
         self.selected_loop = args.loop_id
-        self.values = {loop_id: TuneValues() for loop_id in VALID_LOOP_IDS}
-        self.values[self.selected_loop] = TuneValues(args.kp, args.ki, args.kd, args.aux)
+        self.config_path = Path(args.config)
+        try:
+            self.values = load_config(self.config_path)
+            if self.config_path.exists():
+                print(f"[config] loaded {self.config_path}")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.values = {loop_id: TuneValues() for loop_id in VALID_LOOP_IDS}
+            print(f"[config] ignored {self.config_path}: {exc}", file=sys.stderr)
+
+        for name in ("kp", "ki", "kd", "aux"):
+            value = getattr(args, name)
+            if value is not None:
+                setattr(self.values[self.selected_loop], name, value)
         self.latest: dict[int, Telemetry] = {}
         self.latest_lock = threading.Lock()
         self.write_lock = threading.Lock()
@@ -502,6 +587,14 @@ class TunerApp:
             f"new={getattr(self.values[self.selected_loop], name):g} abs_error={abs_error:g}"
         )
 
+    def save_current_config(self) -> None:
+        try:
+            save_config(self.config_path, self.values)
+        except (OSError, ValueError) as exc:
+            print(f"[config] save failed: {exc}", file=sys.stderr, flush=True)
+            return
+        print(f"[config] saved {self.config_path}", flush=True)
+
     def command_loop(self) -> None:
         print_help()
         while self.connection_error is None:
@@ -555,6 +648,9 @@ class TunerApp:
         if command in {"send", "apply"}:
             self.send_selected()
             return False
+        if command == "save":
+            self.save_current_config()
+            return False
         if command == "stats":
             parser = self.receiver.parser
             print(
@@ -573,6 +669,7 @@ class TunerApp:
                 return
             self.command_loop()
         finally:
+            self.save_current_config()
             self.receiver.stop()
             self.transport.close()
             self.receiver.join(timeout=1.0)
@@ -587,6 +684,7 @@ def print_help() -> None:
         "  set <kp|ki|kd|aux> <value> [loop]  change a value locally\n"
         "  step <kp|ki|kd> <up|down>  adaptive nudge based on telemetry error\n"
         "  send                       transmit selected loop parameters\n"
+        "  save                       save all loop parameters to config JSON\n"
         "  show [loop]                show config and latest telemetry\n"
         "  stats                      show parser statistics\n"
         "  help                       show this help\n"
@@ -614,10 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--timeout", type=float, default=0.25, help="transport read timeout in seconds")
     parser.add_argument("--loop-id", type=int, default=1, choices=sorted(VALID_LOOP_IDS))
-    parser.add_argument("--kp", type=float, default=0.0)
-    parser.add_argument("--ki", type=float, default=0.0)
-    parser.add_argument("--kd", type=float, default=0.0)
-    parser.add_argument("--aux", type=int, default=0)
+    parser.add_argument("--config", default="config.json", help="parameter persistence JSON file")
+    parser.add_argument("--kp", type=float, default=None)
+    parser.add_argument("--ki", type=float, default=None)
+    parser.add_argument("--kd", type=float, default=None)
+    parser.add_argument("--aux", type=int, default=None)
     parser.add_argument(
         "--send-initial",
         action="store_true",

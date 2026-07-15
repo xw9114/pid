@@ -71,6 +71,28 @@ quit
 python tune_console.py --tcp dsp_link <TCP_PORT> --log logs\run.csv
 ```
 
+## 参数持久化
+
+默认配置文件是当前目录下的 `config.json`。程序启动时自动加载，输入 `quit`、按 `Ctrl+C` 或执行 `save` 时保存全部控制环参数。保存采用临时文件替换，避免程序退出时留下半个 JSON 文件。
+
+```powershell
+python tune_console.py --tcp dsp_link <TCP_PORT> --config my_pid.json
+```
+
+配置文件格式：
+
+```json
+{
+  "version": 1,
+  "loops": {
+    "1": {"kp": 10.0, "ki": 0.0, "kd": 0.15, "aux": 0},
+    "2": {"kp": 1.0, "ki": 0.1, "kd": 0.0, "aux": 0}
+  }
+}
+```
+
+命令行显式传入的 `--kp`、`--ki`、`--kd`、`--aux` 会覆盖所选环从配置文件加载的值；未传入的参数保留配置文件值。
+
 ## MCU 协议要求
 
 下行参数帧固定 18 字节：
